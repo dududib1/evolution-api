@@ -2281,7 +2281,7 @@ export class BaileysStartupService extends ChannelStartupService {
   // responde a query, cada mensagem pagava o timeout inteiro e, com o
   // BaileysMessageProcessor serializado via concatMap, a fila toda esperava.
   private profilePicCache = new Map<string, { url: string | null; at: number }>();
-  private static readonly PROFILE_PIC_TTL_MS = 30 * 60 * 1000;
+  private static readonly PROFILE_PIC_TTL_MS = 24 * 60 * 60 * 1000; // 24h: avatar nao precisa de mais
 
   public async profilePicture(number: string) {
     const jid = createJid(number);
