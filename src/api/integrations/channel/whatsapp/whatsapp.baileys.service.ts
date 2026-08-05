@@ -1962,6 +1962,21 @@ export class BaileysStartupService extends ChannelStartupService {
               : message;
           this.sendDataWebhook(Events.MESSAGES_UPDATE, webhookMessage);
 
+          // 463: o ramo do Baileys faz token-recovery mas NÃO consulta a data
+          // da restrição (fetchAccountReachoutTimelock só roda em outro ramo,
+          // inalcançável p/ 463). Disparamos a consulta aqui — o resultado é
+          // emitido pelo Baileys como connection.update {reachoutTimeLock} e
+          // segue pro webhook. Trava de 5 min p/ não martelar o WA.
+          if (webhookMessage !== message && String(stubParams[0]) === '463') {
+            const nowMs = Date.now();
+            if (!this.lastReachoutTimelockFetchAt || nowMs - this.lastReachoutTimelockFetchAt > 5 * 60 * 1000) {
+              this.lastReachoutTimelockFetchAt = nowMs;
+              (this.client as any)
+                .fetchAccountReachoutTimelock?.()
+                ?.catch((err: any) => this.logger.warn(`fetchAccountReachoutTimelock falhou: ${err?.message}`));
+            }
+          }
+
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { message: _msg, ...messageData } = message;
@@ -2309,6 +2324,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // BaileysMessageProcessor serializado via concatMap, a fila toda esperava.
   private profilePicCache = new Map<string, { url: string | null; at: number }>();
   private static readonly PROFILE_PIC_TTL_MS = 24 * 60 * 60 * 1000; // 24h: avatar nao precisa de mais
+
+  // Trava do fetchAccountReachoutTimelock disparado em ack 463 (máx 1x/5min)
+  private lastReachoutTimelockFetchAt?: number;
 
   public async profilePicture(number: string) {
     const jid = createJid(number);
