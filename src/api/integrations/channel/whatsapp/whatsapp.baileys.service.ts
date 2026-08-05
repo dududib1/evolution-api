@@ -388,7 +388,25 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(update: Partial<ConnectionState>) {
+    const { qr, connection, lastDisconnect } = update;
+
+    // rc13 emite a restrição de reachout (conta restrita p/ chats novos) no
+    // connection.update com data de término e tipo; upstream descartava.
+    // Repassamos ao webhook para o CRM exibir o aviso (como o WA Web faz).
+    const reachoutTimeLock = (update as any).reachoutTimeLock;
+    if (reachoutTimeLock) {
+      this.logger.warn(`Reachout timelock update: ${JSON.stringify(reachoutTimeLock)}`);
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        reachoutTimeLock: {
+          isActive: reachoutTimeLock.isActive ?? null,
+          timeEnforcementEnds: reachoutTimeLock.timeEnforcementEnds ?? null,
+          enforcementType: reachoutTimeLock.enforcementType ?? null,
+        },
+      });
+    }
+
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
     this.logger.info({
@@ -1933,7 +1951,16 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
+          // Erros de ack (ex. 463 = conta restrita/reachout) chegam em
+          // messageStubParameters; upstream descartava e o webhook via só um
+          // status ERROR seco. Repassa o código APENAS no webhook — não no
+          // Prisma logo abaixo, cujo schema não tem essas colunas.
+          const stubParams = (update as any).messageStubParameters;
+          const webhookMessage =
+            message.status === 'ERROR' && Array.isArray(stubParams) && stubParams.length
+              ? { ...message, errorCode: stubParams[0] ?? null, errorReason: stubParams[1] ?? null }
+              : message;
+          this.sendDataWebhook(Events.MESSAGES_UPDATE, webhookMessage);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
