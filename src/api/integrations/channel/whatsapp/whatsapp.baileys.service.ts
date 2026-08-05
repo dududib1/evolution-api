@@ -2280,7 +2280,10 @@ export class BaileysStartupService extends ChannelStartupService {
     const jid = createJid(number);
 
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
+      // 5s timeout: sem ele a query cai no defaultQueryTimeoutMs do Baileys (60s)
+      // e, como o BaileysMessageProcessor serializa via concatMap, UMA foto sem
+      // resposta segura a fila inteira de messages.upsert (webhooks gotejando 1/min).
+      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image', 5_000);
 
       return { wuid: jid, profilePictureUrl };
     } catch {
