@@ -2276,17 +2276,32 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  // Cache por-jid do resultado da foto de perfil (inclusive negativo).
+  // messagesUpsert chama profilePicture() a CADA mensagem; quando o WA não
+  // responde a query, cada mensagem pagava o timeout inteiro e, com o
+  // BaileysMessageProcessor serializado via concatMap, a fila toda esperava.
+  private profilePicCache = new Map<string, { url: string | null; at: number }>();
+  private static readonly PROFILE_PIC_TTL_MS = 30 * 60 * 1000;
+
   public async profilePicture(number: string) {
     const jid = createJid(number);
 
-    try {
-      // 5s timeout: sem ele a query cai no defaultQueryTimeoutMs do Baileys (60s)
-      // e, como o BaileysMessageProcessor serializa via concatMap, UMA foto sem
-      // resposta segura a fila inteira de messages.upsert (webhooks gotejando 1/min).
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image', 5_000);
+    const cached = this.profilePicCache.get(jid);
+    if (cached && Date.now() - cached.at < BaileysStartupService.PROFILE_PIC_TTL_MS) {
+      return { wuid: jid, profilePictureUrl: cached.url };
+    }
 
+    // Guarda-chuva contra crescimento sem limite em instâncias muito movimentadas
+    if (this.profilePicCache.size > 5000) this.profilePicCache.clear();
+
+    try {
+      // 3s timeout: sem ele a query cai no defaultQueryTimeoutMs do Baileys (60s)
+      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image', 3_000);
+
+      this.profilePicCache.set(jid, { url: profilePictureUrl, at: Date.now() });
       return { wuid: jid, profilePictureUrl };
     } catch {
+      this.profilePicCache.set(jid, { url: null, at: Date.now() });
       return { wuid: jid, profilePictureUrl: null };
     }
   }
