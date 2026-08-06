@@ -381,6 +381,24 @@ export class InstanceController {
 
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
+
+        // Zombie-safe restart: rebuild the socket unconditionally. Routing
+        // through connectToWhatsapp() no-ops when the cached state still says
+        // 'open' — a dead socket never emits the close event that would update
+        // it — so a zombie connection survived restart forever (2026-08-06:
+        // lp_negocios stuck 'open' with every send failing 'Connection Closed';
+        // only a full container restart cleared it).
+        if (typeof instance.reloadConnection === 'function') {
+          await instance.reloadConnection();
+          await delay(2000);
+          return {
+            instance: {
+              instanceName: instanceName,
+              status: instance.connectionStatus?.state || 'connecting',
+            },
+          };
+        }
+
         return await this.connectToWhatsapp({ instanceName });
       }
 
