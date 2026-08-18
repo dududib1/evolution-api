@@ -47,7 +47,16 @@ export abstract class RouterBroker {
     const instance = request.params as unknown as InstanceDto;
 
     if (request?.query && Object.keys(request.query).length > 0) {
-      Object.assign(instance, sanitizeUntrustedInput(request.query as Record<string, any>));
+      const query = request.query as Record<string, any>;
+      // CVE #2435: the attack vector is overriding the URL's :instanceName via query.
+      // Sanitizing only makes sense when the route HAS the URL param (instance.instanceName
+      // is request.params.instanceName, filled by Express). Routes without the param:
+      //   - GET /instance/fetchInstances → instanceName/instanceId in the query are the
+      //     route's legitimate filter (the manager relies on it to open the right instance);
+      //   - POST /instance/create → keep treating the query as hostile (instanceName may
+      //     only come from the body — carve-out below, from ebd7ab72).
+      const queryIsUntrusted = !!instance.instanceName || request.originalUrl.includes('/instance/create');
+      Object.assign(instance, queryIsUntrusted ? sanitizeUntrustedInput(query) : query);
     }
 
     if (request.originalUrl.includes('/instance/create')) {
