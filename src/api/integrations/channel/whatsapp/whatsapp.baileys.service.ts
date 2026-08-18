@@ -270,6 +270,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // When the current socket was created — a newborn socket needs time to
   // negotiate its first QR before "no QR yet" can mean "generator is dead".
   private socketCreatedAt = 0;
+  // True while a scheduleReconnect-driven rebuild is calling createClient:
+  // tells it to PRESERVE the reconnect budget instead of resetting it.
+  private reconnectRebuildInFlight = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private _lastStream515At = 0;
@@ -910,8 +913,14 @@ export class BaileysStartupService extends ChannelStartupService {
     // A fresh client means a deliberate new session — clear both flags, and
     // give the new session a full reconnect budget (a past exhaustion episode
     // must not abandon the NEXT pairing's 515 restart on the spot).
+    // EXCEPT when this rebuild came from scheduleReconnect itself: resetting
+    // there would restart the backoff at 3s every cycle and the 60s cap would
+    // never be reached during a prolonged outage.
     this.isDeleting = false;
-    this.reconnectAttempts = 0;
+    if (!this.reconnectRebuildInFlight) {
+      this.reconnectAttempts = 0;
+    }
+    this.reconnectRebuildInFlight = false;
 
     // Single-flight: tear down any previous socket before creating a new one.
     // Reload paths used to leak a live twin socket feeding the same state
@@ -1031,15 +1040,23 @@ export class BaileysStartupService extends ChannelStartupService {
       return;
     }
 
-    const delayMs = Math.min(3000 * Math.pow(3, attempt - 1), 60_000);
-    this.logger.info(`Reconnecting in ${delayMs / 1000}s (attempt ${attempt}${established ? '' : '/3'})...`);
+    // ±20% jitter: after a WhatsApp-side outage, N instances must not retry
+    // in synchronized waves.
+    const baseMs = Math.min(3000 * Math.pow(3, attempt - 1), 60_000);
+    const delayMs = Math.round(baseMs * (0.8 + Math.random() * 0.4));
+    this.logger.info(
+      `Reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${attempt}${established ? '' : '/3'})...`,
+    );
     setTimeout(async () => {
       if (this.isDeleting || this.endSession) return;
       try {
+        this.reconnectRebuildInFlight = true;
         await this.connectToWhatsapp(this.phoneNumber);
       } catch (error) {
         this.logger.error(`Reconnect attempt ${attempt} failed: ${(error as Error)?.message ?? error}`);
         this.scheduleReconnect();
+      } finally {
+        this.reconnectRebuildInFlight = false;
       }
     }, delayMs);
   }
@@ -2334,8 +2351,16 @@ export class BaileysStartupService extends ChannelStartupService {
             await this.connectionUpdate(events['connection.update']);
           }
 
-          if (events['creds.update'] && !this.isDeleting && !this.endSession) {
+          // NOT gated on endSession: a pairing completed on the last QR frame
+          // can deliver its creds.update in the same batch that trips the QR
+          // limit — dropping that save loses the pairing. saveCreds on the
+          // shared creds object is idempotent; only deletion must block it.
+          if (events['creds.update'] && !this.isDeleting) {
             await this.instance.authState.saveCreds();
+            // Pairing activity keeps the QR "fresh": a scan at T+88s must not
+            // let a T+91s poll conclude the generator is dead and tear the
+            // socket down mid-pairing.
+            this.lastQrGeneratedAt = Date.now();
           }
 
           if (!this.endSession) {

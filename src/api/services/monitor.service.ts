@@ -430,6 +430,10 @@ export class WAMonitoringService {
 
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
+      // Single try/catch/finally: a rejection from sendDataWebhook (7 emitters,
+      // any broker down throws) must never skip the memory purge — a leaked
+      // deletingInstances marker blocks connect/restart for this name until
+      // the process restarts.
       try {
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
@@ -437,16 +441,16 @@ export class WAMonitoringService {
 
         this.cleaningUp(instanceName);
         this.cleaningStoreData(instanceName);
-      } finally {
-        this.logger.warn(`Instance "${instanceName}" - REMOVED`);
-      }
-
-      try {
-        delete this.waInstances[instanceName];
       } catch (error) {
-        this.logger.error(error);
+        this.logger.error({ localError: 'removeInstance', instanceName, error });
       } finally {
+        try {
+          delete this.waInstances[instanceName];
+        } catch (error) {
+          this.logger.error(error);
+        }
         this.deletingInstances.delete(instanceName);
+        this.logger.warn(`Instance "${instanceName}" - REMOVED`);
       }
     });
     this.eventEmitter.on('logout.instance', async (instanceName: string) => {

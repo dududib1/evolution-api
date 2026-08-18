@@ -492,7 +492,7 @@ export class InstanceController {
     // propósito: um logout de automação numa instância transitoriamente close
     // (queda de rede) não pode destruir uma sessão recuperável.
     if (instance.state === 'close') {
-      const shouldWipe = wipe === true || wipe === 'true';
+      const shouldWipe = wipe === true || ['true', '1'].includes(String(wipe).toLowerCase());
       if (shouldWipe) {
         const waInstance = this.waMonitor.waInstances[instanceName] as any;
         if (typeof waInstance?.clearStoredCredentials === 'function') {
