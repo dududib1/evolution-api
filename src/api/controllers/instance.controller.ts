@@ -326,6 +326,17 @@ export class InstanceController {
       }
 
       if (state == 'connecting') {
+        // A cached QR is only valid for ~60s per frame; a live generator socket
+        // keeps refreshing it. No QR at all, or one older than 90s, means the
+        // socket that generated it is dead — returning the cache is the "ghost
+        // QR" the user scans and nothing happens. Rebuild instead.
+        const ageMs = typeof (instance as any).qrAgeMs === 'number' ? (instance as any).qrAgeMs : null;
+        const qrIsStale = !instance.qrCode?.base64 || (ageMs !== null && ageMs > 90_000);
+        if (qrIsStale && typeof instance.reloadConnection === 'function') {
+          this.logger.warn(`connect: cached QR for "${instanceName}" is stale/missing — rebuilding socket`);
+          await instance.reloadConnection();
+          await delay(2000);
+        }
         return instance.qrCode;
       }
 
@@ -462,7 +473,18 @@ export class InstanceController {
 
     // Idempotente: se já está desconectada, retorna sucesso silenciosamente.
     // Evita falhar o fluxo de delete do painel, que sempre chama logout antes do delete.
+    // MAS ainda limpa as credenciais armazenadas: sem isso, uma sessão morta
+    // (401 engolido no boot) ficava com creds registradas que impedem novo QR
+    // para sempre — e apagar a instância era o único remédio.
     if (instance.state === 'close') {
+      const waInstance = this.waMonitor.waInstances[instanceName] as any;
+      if (typeof waInstance?.clearStoredCredentials === 'function') {
+        try {
+          await waInstance.clearStoredCredentials();
+        } catch (error) {
+          this.logger.warn(`logout(close): credential wipe failed for "${instanceName}": ${error}`);
+        }
+      }
       return { status: 'SUCCESS', error: false, response: { message: 'Instance was already disconnected' } };
     }
 

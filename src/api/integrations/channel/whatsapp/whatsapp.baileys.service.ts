@@ -261,6 +261,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
+  // Bounded-retry state for the reconnect chain (reset on 'open').
+  private reconnectAttempts = 0;
+  // Timestamp of the last QR actually rendered — lets /instance/connect detect
+  // a stale cached QR (dead generator socket) instead of returning it forever.
+  private lastQrGeneratedAt = 0;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private _lastStream515At = 0;
@@ -333,7 +338,7 @@ export class BaileysStartupService extends ChannelStartupService {
    * instance impossible to pair again: Baileys sees the stored identity and
    * tries to re-authenticate instead of requesting a pairing QR code.
    */
-  private async clearStoredCredentials() {
+  public async clearStoredCredentials() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
     const provider = this.configService.get<ProviderSession>('PROVIDER');
@@ -431,7 +436,10 @@ export class BaileysStartupService extends ChannelStartupService {
       endSession: this.endSession,
     });
 
-    if (qr) {
+    // A late QR frame after the session ended must not refire the limit branch
+    // (webhook spam + duplicate no.connection) — the lifecycle events below
+    // still run, this only skips QR processing.
+    if (qr && !this.endSession && !this.isDeleting) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
           message: 'QR code limit reached, please login again',
@@ -456,6 +464,19 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         this.endSession = true;
+
+        // Persist the terminal state: without this the DB row stays 'connecting'
+        // forever (the manager badge fossil) and every boot auto-reconnects the
+        // instance into a fresh doomed QR cycle (incident 2026-08-18: 7 fossils).
+        await this.prismaRepository.instance.update({
+          where: { id: this.instanceId },
+          data: {
+            connectionStatus: 'close',
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: DisconnectReason.connectionClosed,
+            disconnectionObject: JSON.stringify({ reason: 'qr-limit-reached' }),
+          },
+        });
 
         return this.eventEmitter.emit('no.connection', this.instance.name);
       }
@@ -486,6 +507,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         this.instance.qrcode.base64 = base64;
         this.instance.qrcode.code = qr;
+        this.lastQrGeneratedAt = Date.now();
 
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
           qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
@@ -534,6 +556,12 @@ export class BaileysStartupService extends ChannelStartupService {
       // transient network drops where the server returned a 408 in the close.
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
 
+      // On an ESTABLISHED session (wuid set = paired and opened in this process)
+      // a 408 is a transient network drop, not a doomed QR cycle — dying here
+      // permanently killed a healthy 236k-message instance on 2026-08-17. The
+      // no-session case keeps the #2501 no-reconnect behavior.
+      const hasEstablishedSession = !!this.instance.wuid;
+
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
       const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
@@ -563,7 +591,9 @@ export class BaileysStartupService extends ChannelStartupService {
       // logout — so reconnect anyway.
       const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
       const shouldReconnect =
-        !codesToNotReconnect.includes(statusCode) || (statusCode === DisconnectReason.loggedOut && recentStream515);
+        !codesToNotReconnect.includes(statusCode) ||
+        (statusCode === DisconnectReason.loggedOut && recentStream515) ||
+        (statusCode === 408 && hasEstablishedSession);
 
       this.logger.info({
         message: 'Connection closed, evaluating reconnection',
@@ -573,11 +603,7 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       if (shouldReconnect) {
-        // Add 3 second delay before reconnection to prevent rapid reconnection loops
-        this.logger.info('Reconnecting in 3 seconds...');
-        setTimeout(async () => {
-          await this.connectToWhatsapp(this.phoneNumber);
-        }, 3000);
+        this.scheduleReconnect();
       } else {
         this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -619,6 +645,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.warn('connectionUpdate: connection open but client.user is undefined, skipping');
         return;
       }
+      // A real open means the session is alive: clear the QR-exhaustion latch
+      // (a scan on the last frame can complete after endSession was set) and
+      // the reconnect budget.
+      this.endSession = false;
+      this.reconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -849,6 +880,11 @@ export class BaileysStartupService extends ChannelStartupService {
     };
 
     this.endSession = false;
+    // isDeleting was one-way: logoutInstance() set it and nothing ever reset it,
+    // so after any /instance/logout the 515 restart-after-pairing was skipped
+    // forever and re-pairing left half-valid creds ("scans but never connects").
+    // A fresh client means a deliberate new session — clear both flags.
+    this.isDeleting = false;
 
     this.client = makeWASocket(socketConfig);
 
@@ -907,6 +943,45 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
+  }
+
+  /** Age of the last rendered QR in ms; Infinity when none was ever rendered. */
+  public get qrAgeMs(): number {
+    return this.lastQrGeneratedAt ? Date.now() - this.lastQrGeneratedAt : Number.POSITIVE_INFINITY;
+  }
+
+  /**
+   * Bounded reconnect with backoff (3s/9s/27s). The old bare setTimeout ran
+   * connectToWhatsapp() without a catch: any throw inside it (WA web version
+   * fetch, Prisma, proxy) became a swallowed unhandledRejection and the chain
+   * died silently — two instances froze in the same minute during the mass
+   * reconnect of the 2026-08-06 deploy. On exhaustion the instance is closed
+   * in memory AND in the DB so nothing fossilizes as 'connecting'.
+   */
+  private scheduleReconnect() {
+    const attempt = ++this.reconnectAttempts;
+
+    if (attempt > 3) {
+      this.logger.error(`Reconnection abandoned after ${attempt - 1} failed attempts; closing instance`);
+      this.stateConnection = { state: 'close', statusReason: DisconnectReason.connectionLost };
+      this.prismaRepository.instance
+        .update({ where: { id: this.instanceId }, data: { connectionStatus: 'close', disconnectionAt: new Date() } })
+        .catch((error) => this.logger.error(`Failed persisting close after reconnect exhaustion: ${error}`));
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+      return;
+    }
+
+    const delayMs = 3000 * Math.pow(3, attempt - 1);
+    this.logger.info(`Reconnecting in ${delayMs / 1000}s (attempt ${attempt}/3)...`);
+    setTimeout(async () => {
+      if (this.isDeleting || this.endSession) return;
+      try {
+        await this.connectToWhatsapp(this.phoneNumber);
+      } catch (error) {
+        this.logger.error(`Reconnect attempt ${attempt} failed: ${(error as Error)?.message ?? error}`);
+        this.scheduleReconnect();
+      }
+    }, delayMs);
   }
 
   private readonly chatHandle = {
@@ -2179,6 +2254,19 @@ export class BaileysStartupService extends ChannelStartupService {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // Lifecycle events must land even after endSession: with them gated,
+          // a QR-exhausted instance discarded every later connection.update and
+          // creds.update, so its state (memory and DB) froze forever — the
+          // 'connecting' fossil and the half-paired-creds deadlock both start
+          // here. connectionUpdate() itself guards the delete/end flows.
+          if (events['connection.update']) {
+            this.connectionUpdate(events['connection.update']);
+          }
+
+          if (events['creds.update'] && !this.isDeleting) {
+            await this.instance.authState.saveCreds();
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
@@ -2202,13 +2290,8 @@ export class BaileysStartupService extends ChannelStartupService {
               this.sendDataWebhook(Events.CALL, call);
             }
 
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
+            // connection.update / creds.update are dispatched above, outside
+            // this gate — they are lifecycle events and must always land.
 
             if (events['messaging-history.set']) {
               const payload = events['messaging-history.set'];

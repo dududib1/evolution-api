@@ -456,6 +456,17 @@ export class WAMonitoringService {
 
         this.waInstances[instanceName].instance.qrcode = { count: 0 };
         this.waInstances[instanceName].stateConnection.state = 'close';
+
+        // Mirror the memory state into the DB: this handler only fixed the
+        // in-memory state, leaving connectionStatus='connecting' fossilized in
+        // Postgres — which the manager renders and the boot auto-reconnects.
+        const instanceId = this.waInstances[instanceName]?.instanceId;
+        if (instanceId) {
+          await this.prismaRepository.instance.update({
+            where: { id: instanceId },
+            data: { connectionStatus: 'close' },
+          });
+        }
       } catch (error) {
         this.logger.error({
           localError: 'noConnection',
