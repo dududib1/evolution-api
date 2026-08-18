@@ -56,7 +56,17 @@ export abstract class RouterBroker {
       //   - POST /instance/create → keep treating the query as hostile (instanceName may
       //     only come from the body — carve-out below, from ebd7ab72).
       const queryIsUntrusted = !!instance.instanceName || request.originalUrl.includes('/instance/create');
-      Object.assign(instance, queryIsUntrusted ? sanitizeUntrustedInput(query) : query);
+      if (queryIsUntrusted) {
+        Object.assign(instance, sanitizeUntrustedInput(query));
+      } else {
+        // Trusted filter path (fetchInstances): a duplicated key (?instanceName=a&instanceName=b)
+        // parses as an array and would 404/500 downstream — coerce to the first value.
+        const trusted: Record<string, any> = { ...query };
+        for (const key of PROTECTED_INSTANCE_FIELDS) {
+          if (Array.isArray(trusted[key])) trusted[key] = trusted[key][0];
+        }
+        Object.assign(instance, trusted);
+      }
     }
 
     if (request.originalUrl.includes('/instance/create')) {
