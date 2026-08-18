@@ -321,6 +321,10 @@ export class InstanceController {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
+      if (this.waMonitor.deletingInstances.has(instanceName)) {
+        throw new BadRequestException('The "' + instanceName + '" instance is being deleted');
+      }
+
       if (state == 'open') {
         return await this.connectionState({ instanceName });
       }
@@ -330,8 +334,13 @@ export class InstanceController {
         // keeps refreshing it. No QR at all, or one older than 90s, means the
         // socket that generated it is dead — returning the cache is the "ghost
         // QR" the user scans and nothing happens. Rebuild instead.
+        // The 30s socket-age floor keeps QR polls from killing a newborn socket
+        // that is still negotiating its first frame (reloadConnection tears the
+        // old socket down single-flight, but churn is churn).
         const ageMs = typeof (instance as any).qrAgeMs === 'number' ? (instance as any).qrAgeMs : null;
-        const qrIsStale = !instance.qrCode?.base64 || (ageMs !== null && ageMs > 90_000);
+        const sockAgeMs = typeof (instance as any).socketAgeMs === 'number' ? (instance as any).socketAgeMs : null;
+        const socketHadFairChance = sockAgeMs === null || sockAgeMs > 30_000;
+        const qrIsStale = socketHadFairChance && (!instance.qrCode?.base64 || (ageMs !== null && ageMs > 90_000));
         if (qrIsStale && typeof instance.reloadConnection === 'function') {
           this.logger.warn(`connect: cached QR for "${instanceName}" is stale/missing — rebuilding socket`);
           await instance.reloadConnection();
@@ -371,6 +380,10 @@ export class InstanceController {
 
       if (state === 'close') {
         throw new BadRequestException('The "' + instanceName + '" instance is not connected');
+      }
+
+      if (this.waMonitor.deletingInstances.has(instanceName)) {
+        throw new BadRequestException('The "' + instanceName + '" instance is being deleted');
       }
       this.logger.info(`Restarting instance: ${instanceName}`);
 
@@ -468,21 +481,31 @@ export class InstanceController {
     return await this.waMonitor.waInstances[instanceName].setPresence(data);
   }
 
-  public async logout({ instanceName }: InstanceDto) {
+  public async logout({ instanceName, wipe }: InstanceDto & { wipe?: boolean | string }) {
     const { instance } = await this.connectionState({ instanceName });
 
     // Idempotente: se já está desconectada, retorna sucesso silenciosamente.
     // Evita falhar o fluxo de delete do painel, que sempre chama logout antes do delete.
-    // MAS ainda limpa as credenciais armazenadas: sem isso, uma sessão morta
-    // (401 engolido no boot) ficava com creds registradas que impedem novo QR
-    // para sempre — e apagar a instância era o único remédio.
+    // Com ?wipe=true, ainda limpa as credenciais armazenadas: sem isso, uma
+    // sessão morta (401 engolido) ficava com creds registradas que impedem novo
+    // QR para sempre — e apagar a instância era o único remédio. OPT-IN de
+    // propósito: um logout de automação numa instância transitoriamente close
+    // (queda de rede) não pode destruir uma sessão recuperável.
     if (instance.state === 'close') {
-      const waInstance = this.waMonitor.waInstances[instanceName] as any;
-      if (typeof waInstance?.clearStoredCredentials === 'function') {
-        try {
-          await waInstance.clearStoredCredentials();
-        } catch (error) {
-          this.logger.warn(`logout(close): credential wipe failed for "${instanceName}": ${error}`);
+      const shouldWipe = wipe === true || wipe === 'true';
+      if (shouldWipe) {
+        const waInstance = this.waMonitor.waInstances[instanceName] as any;
+        if (typeof waInstance?.clearStoredCredentials === 'function') {
+          try {
+            await waInstance.clearStoredCredentials();
+            return {
+              status: 'SUCCESS',
+              error: false,
+              response: { message: 'Instance was already disconnected; stored credentials wiped' },
+            };
+          } catch (error) {
+            this.logger.warn(`logout(close): credential wipe failed for "${instanceName}": ${error}`);
+          }
         }
       }
       return { status: 'SUCCESS', error: false, response: { message: 'Instance was already disconnected' } };
@@ -499,6 +522,10 @@ export class InstanceController {
 
   public async deleteInstance({ instanceName }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
+    // Marca a deleção ANTES do logout: um poll de /connect ou /restart na
+    // janela logout→purge não pode ressuscitar um socket para uma instância
+    // sendo apagada. O handler de remove.instance limpa a marca no finally.
+    this.waMonitor.deletingInstances.add(instanceName);
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
@@ -533,6 +560,9 @@ export class InstanceController {
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
+      // Deleção falhou antes do remove.instance — desmarca para não bloquear
+      // connect/restart para sempre (o caminho de sucesso limpa no handler).
+      this.waMonitor.deletingInstances.delete(instanceName);
       throw new BadRequestException(error.toString());
     }
   }

@@ -38,6 +38,10 @@ export class WAMonitoringService {
 
   private readonly logger = new Logger('WAMonitoringService');
   public readonly waInstances: Record<string, any> = {};
+  // Instances mid-deletion: connect/restart must refuse them, or a QR poll
+  // landing between logout and the waInstances purge resurrects a socket for
+  // an instance being erased from the DB.
+  public readonly deletingInstances = new Set<string>();
   private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
 
   private readonly providerSession: ProviderSession;
@@ -310,6 +314,11 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
+    // Register BEFORE the auto-connect: a throw inside connectToWhatsapp used
+    // to leave the instance out of waInstances entirely — invisible (404 on
+    // every endpoint) until the whole process restarted.
+    this.waInstances[instanceData.instanceName] = instance;
+
     if (
       instanceData.connectionStatus === 'open' ||
       instanceData.connectionStatus === 'connecting' ||
@@ -319,14 +328,22 @@ export class WAMonitoringService {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
-      await instance.connectToWhatsapp();
+      try {
+        await instance.connectToWhatsapp();
+      } catch (error) {
+        // Mass-boot connects share the Prisma pool and the WA version fetch —
+        // one failure must not become an unhandledRejection that freezes the
+        // instance silently (incident 2026-08-06: two instances in the same
+        // minute). The instance stays registered and can be connected manually.
+        this.logger.error(
+          `Boot auto-connect failed for "${instanceData.instanceName}": ${(error as Error)?.message ?? error}`,
+        );
+      }
     } else {
       this.logger.info(
         `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
       );
     }
-
-    this.waInstances[instanceData.instanceName] = instance;
   }
 
   private async loadInstancesFromRedis() {
@@ -428,6 +445,8 @@ export class WAMonitoringService {
         delete this.waInstances[instanceName];
       } catch (error) {
         this.logger.error(error);
+      } finally {
+        this.deletingInstances.delete(instanceName);
       }
     });
     this.eventEmitter.on('logout.instance', async (instanceName: string) => {

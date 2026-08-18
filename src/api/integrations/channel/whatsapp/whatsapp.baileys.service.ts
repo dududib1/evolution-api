@@ -261,11 +261,15 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
-  // Bounded-retry state for the reconnect chain (reset on 'open').
+  // Bounded-retry state for the reconnect chain (reset on 'open' and on
+  // createClient — a deliberate new session starts with a full budget).
   private reconnectAttempts = 0;
   // Timestamp of the last QR actually rendered — lets /instance/connect detect
   // a stale cached QR (dead generator socket) instead of returning it forever.
   private lastQrGeneratedAt = 0;
+  // When the current socket was created — a newborn socket needs time to
+  // negotiate its first QR before "no QR yet" can mean "generator is dead".
+  private socketCreatedAt = 0;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private _lastStream515At = 0;
@@ -361,10 +365,14 @@ export class BaileysStartupService extends ChannelStartupService {
       await authState.removeCreds();
     }
 
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
-    if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
-    }
+    // deleteMany: idempotent and TOCTOU-free — concurrent wipes (logout +
+    // initial-401 path) must not race a findFirst+delete into a P2025 throw.
+    await this.prismaRepository.session.deleteMany({ where: { sessionId: this.instanceId } });
+
+    // The in-memory identity falls with the credentials: hasEstablishedSession
+    // must not treat a wiped session as established during re-pairing (a stale
+    // wuid would turn the QR flow's terminal 408 into an endless retry loop).
+    this.instance.wuid = undefined;
 
     await this.prismaRepository.instance.update({
       where: { id: this.instanceId },
@@ -468,15 +476,21 @@ export class BaileysStartupService extends ChannelStartupService {
         // Persist the terminal state: without this the DB row stays 'connecting'
         // forever (the manager badge fossil) and every boot auto-reconnects the
         // instance into a fresh doomed QR cycle (incident 2026-08-18: 7 fossils).
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: DisconnectReason.connectionClosed,
-            disconnectionObject: JSON.stringify({ reason: 'qr-limit-reached' }),
-          },
-        });
+        // Guarded: a transient DB failure must not abort the no.connection emit
+        // below — the memory teardown matters more than the DB mirror.
+        try {
+          await this.prismaRepository.instance.update({
+            where: { id: this.instanceId },
+            data: {
+              connectionStatus: 'close',
+              disconnectionAt: new Date(),
+              disconnectionReasonCode: DisconnectReason.connectionClosed,
+              disconnectionObject: JSON.stringify({ reason: 'qr-limit-reached' }),
+            },
+          });
+        } catch (error) {
+          this.logger.error(`Failed persisting close after QR limit: ${error}`);
+        }
 
         return this.eventEmitter.emit('no.connection', this.instance.name);
       }
@@ -556,26 +570,40 @@ export class BaileysStartupService extends ChannelStartupService {
       // transient network drops where the server returned a 408 in the close.
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
 
-      // On an ESTABLISHED session (wuid set = paired and opened in this process)
-      // a 408 is a transient network drop, not a doomed QR cycle — dying here
-      // permanently killed a healthy 236k-message instance on 2026-08-17. The
-      // no-session case keeps the #2501 no-reconnect behavior.
-      const hasEstablishedSession = !!this.instance.wuid;
+      // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
+      // a follow-up loggedOut is the expected restart signal — not an actual
+      // logout — so reconnect anyway. Computed BEFORE the initial-connection
+      // branch: a fake post-515 loggedOut arriving pre-open must not wipe
+      // valid credentials.
+      const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
+
+      // A stored REGISTERED session (paired in some previous process) is not an
+      // "initial connection": wuid is only set on 'open' of the current process,
+      // so on boot a healthy paired instance briefly looks initial — and a
+      // transient 408/428 during that handshake used to be swallowed silently,
+      // leaving DB 'open' with a dead in-memory instance.
+      const storedSessionRegistered = !!this.instance.authState?.state?.creds?.registered;
+
+      // On an ESTABLISHED session (opened in this process OR registered creds
+      // on disk) a 408 is a transient network drop, not a doomed QR cycle —
+      // dying here permanently killed a healthy 236k-message instance on
+      // 2026-08-17. The no-session case keeps the #2501 no-reconnect behavior.
+      const hasEstablishedSession = !!this.instance.wuid || storedSessionRegistered;
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
-      // This prevents infinite loop that blocks QR code generation
-      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+      // This prevents infinite loop that blocks QR code generation (#2365)
+      const isInitialConnection =
+        !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0 && !storedSessionRegistered;
 
       if (isInitialConnection) {
         // A loggedOut here means the credentials we had stored were rejected
-        // before any QR code could be issued. Returning without clearing them
-        // makes the instance permanently unpairable: on every later attempt
-        // Baileys finds the stored identity (`me` / `account`), tries to
-        // re-authenticate with it instead of asking for a pairing code, gets
-        // another 401, and comes back here. The instance loops forever with
-        // `hasQr: false` and /instance/connect keeps returning an empty code,
-        // so the QR dialog spins and the phone reports a network problem.
-        if (statusCode === DisconnectReason.loggedOut) {
+        // before any QR code could be issued (half-valid creds: `me`/`account`
+        // present but not registered). Returning without clearing them makes
+        // the instance permanently unpairable: Baileys keeps finding the stored
+        // identity, re-authenticates, takes another 401 and loops forever with
+        // `hasQr: false` while /instance/connect returns an empty code.
+        // recentStream515 exempts the fake loggedOut of a 515 restart.
+        if (statusCode === DisconnectReason.loggedOut && !recentStream515) {
           this.logger.warn(
             'Stored credentials were rejected (401) before a QR code was issued; clearing them so the next attempt can pair',
           );
@@ -586,10 +614,6 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
-      // a follow-up loggedOut is the expected restart signal — not an actual
-      // logout — so reconnect anyway.
-      const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
       const shouldReconnect =
         !codesToNotReconnect.includes(statusCode) ||
         (statusCode === DisconnectReason.loggedOut && recentStream515) ||
@@ -883,8 +907,33 @@ export class BaileysStartupService extends ChannelStartupService {
     // isDeleting was one-way: logoutInstance() set it and nothing ever reset it,
     // so after any /instance/logout the 515 restart-after-pairing was skipped
     // forever and re-pairing left half-valid creds ("scans but never connects").
-    // A fresh client means a deliberate new session — clear both flags.
+    // A fresh client means a deliberate new session — clear both flags, and
+    // give the new session a full reconnect budget (a past exhaustion episode
+    // must not abandon the NEXT pairing's 515 restart on the spot).
     this.isDeleting = false;
+    this.reconnectAttempts = 0;
+
+    // Single-flight: tear down any previous socket before creating a new one.
+    // Reload paths used to leak a live twin socket feeding the same state
+    // machine (double QR counting, phantom closes, credential wipes during an
+    // active pairing). Detach FIRST so anything the dying socket still emits
+    // fails the generation guard in eventHandler().
+    if (this.client) {
+      const previous = this.client;
+      this.client = undefined as unknown as WASocket;
+      try {
+        previous.ws?.close();
+        previous.end(new Error('Socket replaced by a new connection'));
+      } catch {
+        // ignore — socket may already be dead
+      }
+    }
+
+    // Fresh socket = fresh QR cycle: the staleness predicate in
+    // /instance/connect must not read leftovers from the previous cycle.
+    this.instance.qrcode = { count: 0 };
+    this.lastQrGeneratedAt = 0;
+    this.socketCreatedAt = Date.now();
 
     this.client = makeWASocket(socketConfig);
 
@@ -950,6 +999,11 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.lastQrGeneratedAt ? Date.now() - this.lastQrGeneratedAt : Number.POSITIVE_INFINITY;
   }
 
+  /** Age of the current socket in ms; Infinity when no socket was ever created. */
+  public get socketAgeMs(): number {
+    return this.socketCreatedAt ? Date.now() - this.socketCreatedAt : Number.POSITIVE_INFINITY;
+  }
+
   /**
    * Bounded reconnect with backoff (3s/9s/27s). The old bare setTimeout ran
    * connectToWhatsapp() without a catch: any throw inside it (WA web version
@@ -960,8 +1014,14 @@ export class BaileysStartupService extends ChannelStartupService {
    */
   private scheduleReconnect() {
     const attempt = ++this.reconnectAttempts;
+    // An established session (opened in this process or registered creds on
+    // disk) never gives up: 3 attempts cover only ~40s and a WhatsApp/network
+    // outage longer than that would otherwise kill healthy paired instances
+    // permanently. Backoff caps at 60s. The 3-attempt limit stays for the
+    // unpaired/QR flow, where giving up is correct.
+    const established = !!this.instance.wuid || !!this.instance.authState?.state?.creds?.registered;
 
-    if (attempt > 3) {
+    if (!established && attempt > 3) {
       this.logger.error(`Reconnection abandoned after ${attempt - 1} failed attempts; closing instance`);
       this.stateConnection = { state: 'close', statusReason: DisconnectReason.connectionLost };
       this.prismaRepository.instance
@@ -971,8 +1031,8 @@ export class BaileysStartupService extends ChannelStartupService {
       return;
     }
 
-    const delayMs = 3000 * Math.pow(3, attempt - 1);
-    this.logger.info(`Reconnecting in ${delayMs / 1000}s (attempt ${attempt}/3)...`);
+    const delayMs = Math.min(3000 * Math.pow(3, attempt - 1), 60_000);
+    this.logger.info(`Reconnecting in ${delayMs / 1000}s (attempt ${attempt}${established ? '' : '/3'})...`);
     setTimeout(async () => {
       if (this.isDeleting || this.endSession) return;
       try {
@@ -2251,19 +2311,30 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // Generation guard: events from a replaced/torn-down socket must never
+    // reach the shared state machine (twin sockets corrupted QR counting,
+    // wiped credentials mid-pairing and scheduled spurious reconnects).
+    const sock = this.client;
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          if (sock !== this.client) {
+            return;
+          }
+
           // Lifecycle events must land even after endSession: with them gated,
           // a QR-exhausted instance discarded every later connection.update and
           // creds.update, so its state (memory and DB) froze forever — the
           // 'connecting' fossil and the half-paired-creds deadlock both start
           // here. connectionUpdate() itself guards the delete/end flows.
+          // AWAITED: it now contains Prisma writes — fire-and-forget would leak
+          // rejections past this try/catch and could interleave a credential
+          // wipe with the saveCreds below.
           if (events['connection.update']) {
-            this.connectionUpdate(events['connection.update']);
+            await this.connectionUpdate(events['connection.update']);
           }
 
-          if (events['creds.update'] && !this.isDeleting) {
+          if (events['creds.update'] && !this.isDeleting && !this.endSession) {
             await this.instance.authState.saveCreds();
           }
 
