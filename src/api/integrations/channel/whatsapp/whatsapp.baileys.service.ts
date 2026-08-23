@@ -143,7 +143,6 @@ import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
-import { getLinkPreview } from 'link-preview-js';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
@@ -869,7 +868,14 @@ export class BaileysStartupService extends ChannelStartupService {
         keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
-      generateHighQualityLinkPreview: true,
+      // 2026-08-23 — de volta ao default do Baileys (false).
+      // Com `true`, a miniatura da previa e BAIXADA do site e SUBIDA para o
+      // servidor de midia do WhatsApp, e a mensagem de texto passa a carregar
+      // um objeto de midia cifrado (thumbnailDirectPath/mediaKey/sha256).
+      // Somado ao card de anuncio forjado, produzia uma mensagem que nenhum
+      // cliente WhatsApp real emite. A previa continua existindo, com
+      // jpegThumbnail inline — sem upload, sem latencia extra por envio.
+      generateHighQualityLinkPreview: false,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       // Removido browserOptions para usar Multi-Device nativo (não WebClient)
       markOnlineOnConnect: this.localSettings.alwaysOnline,
@@ -2651,46 +2657,6 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async generateLinkPreview(text: string) {
-    try {
-      const linkRegex = /https?:\/\/[^\s]+/;
-      const match = text.match(linkRegex);
-
-      if (!match) return undefined;
-
-      // Trim common trailing punctuation that may follow URLs in natural text
-      const url = match[0].replace(/[.,);\]]+$/u, '');
-      if (!url) return undefined;
-
-      const previewData = (await getLinkPreview(url, {
-        imagesPropertyType: 'og', // fetches only open-graph images
-        headers: {
-          'user-agent': 'googlebot', // fetches with googlebot to prevent login pages
-        },
-      })) as any;
-
-      if (!previewData || !previewData.title) return undefined;
-
-      const image = previewData.images && previewData.images.length > 0 ? previewData.images[0] : undefined;
-
-      return {
-        externalAdReply: {
-          title: previewData.title,
-          body: previewData.description,
-          mediaType: 2, // 2 for video/image preview, though usually 1 is for thumbnail
-          thumbnailUrl: image,
-          sourceUrl: url,
-          mediaUrl: url,
-          renderLargerThumbnail: true,
-          // showAdAttribution: true // Removed to prevent "Sent via ad" label
-        },
-      };
-    } catch (error) {
-      this.logger.error(`Error generating link preview: ${error}`);
-      return undefined;
-    }
-  }
-
   private async sendMessage(
     sender: string,
     message: any,
@@ -2909,10 +2875,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const linkPreview = options?.linkPreview === false ? false : undefined;
 
-      let previewContext: any = undefined;
-      if (linkPreview !== false && (message as any)?.conversation) {
-        previewContext = await this.generateLinkPreview((message as any).conversation);
-      }
+      // 2026-08-23 — NAO montamos mais o externalAdReply.
+      //
+      // O PR upstream #2347 passou a injetar contextInfo.externalAdReply em toda
+      // mensagem 1:1 com URL. Esse campo e a estrutura de atribuicao de anuncio
+      // Click-to-WhatsApp (ctwaClid/sourceId/AdType) e so a infra de anuncios da
+      // Meta emite: numa mensagem organica ele e uma FALSIFICACAO. O mesmo PR
+      // removeu showAdAttribution de proposito, para esconder o rotulo
+      // "enviado via anuncio".
+      //
+      // Clientes novos do WhatsApp passaram a RECUSAR a mensagem (Baileys #2544:
+      // "The client cannot see the message"). Validacao no APARELHO, nao no
+      // servidor: o servidor aceita, o SERVER_ACK chega, o DELIVERY_ACK nunca vem
+      // e nenhum erro aparece.
+      //
+      // Medido em producao (20-23/08/2026, recibos crus): mensagem com link
+      // saindo do CRM entregava 7,7% (1/13); o MESMO numero, pelo app do celular
+      // e pelo Botconversa, entregava 91,4% (53/58). O celular tambem gera
+      // previa — o que ele nao faz e forjar o bloco de anuncio.
+      //
+      // Deixando previewContext indefinido, o proprio Baileys gera a previa
+      // NATIVA (matchedText/title/description/jpegThumbnail), que e o que um
+      // cliente WhatsApp de verdade emite. A previa continua aparecendo.
+      const previewContext: any = undefined;
 
       let quoted: WAMessage;
 
