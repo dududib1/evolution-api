@@ -1,3 +1,45 @@
+diff --git a/node_modules/baileys/lib/Socket/messages-send.js b/node_modules/baileys/lib/Socket/messages-send.js
+index d61e064..163f728 100644
+--- a/node_modules/baileys/lib/Socket/messages-send.js
++++ b/node_modules/baileys/lib/Socket/messages-send.js
+@@ -36,9 +36,20 @@ export const makeMessagesSocket = (config) => {
+     /** Per-socket media host; updated whenever media_conn is fetched. Defaults to the public WhatsApp host. */
+     let mediaHost = DEF_MEDIA_HOST;
+     const refreshMediaConn = async (forceGet = false) => {
+-        const media = await mediaConn;
++        // AEDU: uma consulta media_conn que falhou (ex.: disparada com o socket
++        // ainda abrindo → 'Connection Closed') deixava a promessa REJEITADA no
++        // cache. O `await` abaixo relançava o erro antes de olhar forceGet/ttl,
++        // e toda mídia falhava até o socket morrer, enquanto o texto seguia ok
++        // (LP Cristo, 14/10/2026). Falha não fica em cache: tenta de novo.
++        let media;
++        try {
++            media = await mediaConn;
++        }
++        catch {
++            media = undefined;
++        }
+         if (!media || forceGet || new Date().getTime() - media.fetchDate.getTime() > media.ttl * 1000) {
+-            mediaConn = (async () => {
++            const attempt = (async () => {
+                 const result = await query({
+                     tag: 'iq',
+                     attrs: {
+@@ -65,6 +76,14 @@ export const makeMessagesSocket = (config) => {
+                 }
+                 return node;
+             })();
++            mediaConn = attempt;
++            // Quem chamou recebe a rejeição; o cache só a esquece (e só se
++            // ninguém o substituiu nesse meio-tempo).
++            attempt.catch(() => {
++                if (mediaConn === attempt) {
++                    mediaConn = undefined;
++                }
++            });
+         }
+         return mediaConn;
+     };
 diff --git a/node_modules/baileys/lib/Socket/socket.js b/node_modules/baileys/lib/Socket/socket.js
 index 6357f9e..8c32c2d 100644
 --- a/node_modules/baileys/lib/Socket/socket.js
