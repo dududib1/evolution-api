@@ -88,6 +88,7 @@ import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { decryptMessageEdit, editAuthorJids, toMessageSecret } from '@utils/secretEncryptedEdit';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -118,6 +119,7 @@ import makeWASocket, {
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
+  isLidUser,
   isPnUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -286,6 +288,7 @@ export class BaileysStartupService extends ChannelStartupService {
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
+  private readonly MESSAGE_SECRET_CACHE_TTL_SECONDS = 24 * 60 * 60; // 24 hours - edits are allowed for 15 minutes; margin for late delivery
 
   // Reconnect behaviour for the Baileys "stream:error 515" sequence.
   // After WhatsApp emits 515 it usually closes with `loggedOut`; that close is *not* a real logout
@@ -777,6 +780,74 @@ export class BaileysStartupService extends ChannelStartupService {
       return webMessageInfo[0].message;
     } catch {
       return { conversation: '' };
+    }
+  }
+
+  private messageSecretCacheKey(messageId: string) {
+    return `msgsecret_${this.instanceId}_${messageId}`;
+  }
+
+  // WhatsApp now sends edits encrypted (see utils/secretEncryptedEdit). Returns
+  // the decrypted edit, which then follows the clear-text edit path — or
+  // undefined, which keeps the envelope's previous handling (a plain upsert).
+  // Never throws: it runs inside the upsert loop, where an exception would drop
+  // the rest of the batch.
+  private async decryptSecretEdit(received: WAMessage): Promise<proto.Message.IProtocolMessage | undefined> {
+    const envelope = received?.message?.secretEncryptedMessage;
+    const originalKey = envelope?.targetMessageKey;
+
+    if (
+      envelope?.secretEncType !== proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT ||
+      !originalKey?.id
+    ) {
+      return undefined;
+    }
+
+    try {
+      const messageSecret =
+        toMessageSecret(await this.baileysCache.get(this.messageSecretCacheKey(originalKey.id))) ??
+        toMessageSecret(
+          ((await this.getMessage(originalKey, true)) as any)?.message?.messageContextInfo?.messageSecret,
+        );
+
+      if (!messageSecret) {
+        // Expected when we edit a message sent from another device of this
+        // account: the copy this session receives carries no messageSecret.
+        const reason = `Encrypted edit of ${originalKey.id} not applied: original messageSecret unavailable`;
+        if (received.key.fromMe) {
+          this.logger.verbose(`${reason} (sent from another device of this account)`);
+        } else {
+          this.logger.warn(reason);
+        }
+        return undefined;
+      }
+
+      const authorJids = editAuthorJids(received.key, [
+        this.instance.wuid,
+        this.client.user?.lid,
+        this.client.user?.id,
+      ]);
+
+      // The key derives from the author's LID, which the payload usually carries
+      // in remoteJidAlt — but not always.
+      const pn = authorJids.find((jid) => isPnUser(jid));
+      if (pn && !authorJids.some((jid) => isLidUser(jid))) {
+        const { lid } = await this.getLid(pn);
+        if (lid) authorJids.push(lid);
+      }
+
+      const edit = decryptMessageEdit({ envelope, messageSecret, authorJids, receivedKey: received.key });
+
+      if (!edit) {
+        this.logger.warn(
+          `Encrypted edit of ${originalKey.id} not applied: no author candidate authenticated (${authorJids.length} tried)`,
+        );
+      }
+
+      return edit ?? undefined;
+    } catch (error) {
+      this.logger.error(`Encrypted edit of ${originalKey.id} not applied: ${error?.message ?? error}`);
+      return undefined;
     }
   }
 
@@ -1504,8 +1575,23 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          // Keep the secret an edit of this message will be encrypted with (see
+          // decryptSecretEdit). Cached rather than only read back from the stored
+          // message, so decrypting depends neither on DATABASE_SAVE_DATA_NEW_MESSAGE
+          // nor on how the stored JSON serialized the bytes.
+          const messageSecret = received?.message?.messageContextInfo?.messageSecret;
+          if (received?.key?.id && messageSecret?.length) {
+            await this.baileysCache.set(
+              this.messageSecretCacheKey(received.key.id),
+              Buffer.from(messageSecret).toString('base64'),
+              this.MESSAGE_SECRET_CACHE_TTL_SECONDS,
+            );
+          }
+
           const editedMessage =
-            received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+            received?.message?.protocolMessage ||
+            received?.message?.editedMessage?.message?.protocolMessage ||
+            (await this.decryptSecretEdit(received));
 
           if (editedMessage) {
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
