@@ -34,7 +34,9 @@ lerna-debug.log*
 # Project related
 /instances/*
 !/instances/.gitkeep
-/test/
+# Unit tests (`npm test`) are versioned; anything else under test/ stays local
+/test/*
+!/test/*.test.ts
 /src/env.yml
 /store
 *.env
