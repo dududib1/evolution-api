@@ -1,3 +1,25 @@
+diff --git a/node_modules/baileys/lib/Socket/messages-recv.js b/node_modules/baileys/lib/Socket/messages-recv.js
+index f2003ac..98240b1 100644
+--- a/node_modules/baileys/lib/Socket/messages-recv.js
++++ b/node_modules/baileys/lib/Socket/messages-recv.js
+@@ -1624,6 +1624,17 @@ export const makeMessagesRecvSocket = (config) => {
+     ws.on('CB:ack,class:message', (node) => {
+         handleBadAck(node).catch(error => onUnexpectedError(error, 'handling bad ack'));
+     });
++    // AEDU: o WhatsApp passou a entregar Status de alguns contatos como uma
++    // stanza <status> de primeiro nível, que o rc13 não trata. Sem o ack, o
++    // servidor derruba a conexão 50 min depois (stream:error com
++    // <ack class="status">, que vira badSession 500) e reentrega o mesmo
++    // Status a cada reconexão (em produção, de 14/10 a 26/10/2026). A
++    // Evolution ignora Status (readStatus: false), então só confirmamos e
++    // descartamos. Ack sem código de erro de propósito: um NACK deixa a
++    // stanza pendente no servidor. Ver WhiskeySockets/Baileys#2858.
++    ws.on('CB:status', (node) => {
++        sendMessageAck(node).catch(error => onUnexpectedError(error, 'acking status stanza'));
++    });
+     ev.on('call', async ([call]) => {
+         if (!call) {
+             return;
 diff --git a/node_modules/baileys/lib/Socket/messages-send.js b/node_modules/baileys/lib/Socket/messages-send.js
 index d61e064..163f728 100644
 --- a/node_modules/baileys/lib/Socket/messages-send.js
