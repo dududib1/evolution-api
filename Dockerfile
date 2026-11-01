@@ -16,7 +16,10 @@ COPY ./patches ./patches
 
 RUN npm ci --silent
 
-RUN npx patch-package
+# AEDU: fora de CI o patch-package termina com código 0 mesmo quando um patch
+# não aplica, e a imagem sairia sem as correções do Baileys. Com --error-on-fail
+# o build para nesse caso.
+RUN npx patch-package --error-on-fail
 
 COPY ./src ./src
 COPY ./public ./public
